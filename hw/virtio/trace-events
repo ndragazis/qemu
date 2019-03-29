@@ -67,4 +67,7 @@ virtio_vhost_user_chr_change(void *s) "s %p"
 virtio_vhost_user_conn_state_transition(void *s, int old_state, int event, int new_state) "s %p old_state %d event %d new_state %d"
 virtio_vhost_user_set_config(void *s, unsigned int old_status, unsigned int new_status) "s %p old_status %u new_status %u"
 virtio_vhost_user_doorbell_write(void *s, unsigned int vq_idx, ssize_t nwritten) "s %p vq_idx %u nwritten %zd"
+virtio_vhost_user_notification_read(void *s, uint64_t addr, uint64_t return_val) "s %p addr %"PRIx64" return_val %"PRIx64
+virtio_vhost_user_notification_write(void *s, uint64_t addr, uint64_t val) "s %p addr %"PRIx64" val %"PRIx64
+virtio_vhost_user_guest_notifier_read(int kickfd, uint16_t vector) "kickfd %d vector 0x%"PRIx16
 virtio_vhost_user_memory_region(void *s, uint64_t guest_phys_addr, uint64_t memory_size, uint64_t userspace_addr, uint64_t mmap_offset, void *mmap_addr) "s %p guest_phys_addr 0x%"PRIx64" memory_size 0x%"PRIx64" userspace_addr 0x%"PRIx64" mmap_offset 0x%"PRIx64" mmap_addr %p"

@@ -20,6 +20,7 @@
 #include "hw/virtio/virtio-vhost-user.h"
 #include "virtio-pci.h" /* TODO remove, see virtio_vhost_user_init_bar() */
 #include "trace.h"
+#include "hw/pci/msix.h"
 
 /* vmstate migration version number */
 #define VIRTIO_VHOST_USER_VM_VERSION    0
@@ -32,12 +33,6 @@
 /* Protocol features that have been implemented */
 #define SUPPORTED_VHOST_USER_FEATURES \
     (VHOST_USER_PROTOCOL_F_MQ | VHOST_USER_PROTOCOL_F_REPLY_ACK)
-
-enum {
-    /* TODO Doorbell register size in bytes.  Remove this, see
-     * virtio_vhost_user_init_bar() */
-    DOORBELLS_SIZE = (VIRTIO_QUEUE_MAX + 1 /* logfd */) * sizeof(uint16_t),
-};
 
 /* Connection state machine
  *
@@ -98,6 +93,17 @@ typedef enum {
 } ConnectionEvent;
 
 static void conn_state_transition(VirtIOVhostUser *s, ConnectionEvent evt);
+void virtio_vhost_user_guest_notifier_read(EventNotifier *n);
+
+/* TODO Add those function prototypes temporarily. Remove then later. */
+void virtio_set_isr(VirtIODevice *vdev, int value);
+void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector);
+int virtio_pci_queue_mem_mult(struct VirtIOPCIProxy *proxy);
+void virtio_pci_modern_region_map(VirtIOPCIProxy *proxy,
+                                  VirtIOPCIRegion *region,
+                                  struct virtio_pci_cap *cap,
+                                  MemoryRegion *mr,
+                                  uint8_t bar);
 
 static void virtio_vhost_user_reset_async_state(VirtIOVhostUser *s)
 {
@@ -243,6 +249,20 @@ static void virtio_vhost_user_aio_write(VirtIOVhostUser *s,
     virtio_vhost_user_chr_write(NULL, 0, s);
 }
 
+static void virtio_vhost_user_cleanup_kickfds(VirtIOVhostUser *s)
+{
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(s->kickfds); i++) {
+       if (event_notifier_get_fd(&s->kickfds[i].guest_notifier) >= 0) {
+           /* Remove the kickfd from the main event loop */
+            event_notifier_set_handler(&s->kickfds[i].guest_notifier, NULL);
+           event_notifier_cleanup(&s->kickfds[i].guest_notifier);
+           s->kickfds[i].msi_vector = VIRTIO_NO_VECTOR;
+       }
+    }
+}
+
 static void virtio_vhost_user_cleanup_callfds(VirtIOVhostUser *s)
 {
     size_t i;
@@ -320,6 +340,7 @@ static void conn_action_disconnect_no_notify(VirtIOVhostUser *s)
      * invalid indices are ignored.  Memory table regions cannot be unmapped
      * since vring polling may still be running.
      */
+    virtio_vhost_user_cleanup_kickfds(s);
     virtio_vhost_user_cleanup_callfds(s);
 
     s->config.status = 0;
@@ -440,13 +461,28 @@ static void virtio_vhost_user_deliver_m2s(VirtIOVhostUser *s)
 
 static void m2s_set_vring_kick(VirtIOVhostUser *s)
 {
+    uint8_t vq_idx;
+    int fd;
+
+    vq_idx = s->read_msg.payload.u64 & VHOST_USER_VRING_IDX_MASK;
+
     if (s->read_msg.payload.u64 & VHOST_USER_VRING_NOFD_MASK) {
-        return;
+        fd = -1;
+    } else {
+        fd = qemu_chr_fe_get_msgfd(&s->chr);
     }
 
-    /* TODO implement an interrupt.  For now we force polling mode. */
-    close(qemu_chr_fe_get_msgfd(&s->chr));
-    s->read_msg.payload.u64 |= VHOST_USER_VRING_NOFD_MASK;
+    if (event_notifier_get_fd(&s->kickfds[vq_idx].guest_notifier) >= 0) {
+       /* Remove the kickfd from the main event loop */
+       event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, NULL);
+       event_notifier_cleanup(&s->kickfds[vq_idx].guest_notifier);
+    }
+
+    /* Initialize the EventNotifier with the received kickfd */
+    event_notifier_init_fd(&s->kickfds[vq_idx].guest_notifier, fd);
+
+    /* Insert the kickfd in the main event loop */
+    event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, virtio_vhost_user_guest_notifier_read);
 }
 
 static void m2s_set_vring_call(VirtIOVhostUser *s)
@@ -496,8 +532,9 @@ static void m2s_set_mem_table(VirtIOVhostUser *s)
 
     virtio_vhost_user_cleanup_mem_table(s);
 
-    /* Start after the doorbell registers */
-    subregion_offset = QEMU_ALIGN_UP(DOORBELLS_SIZE, 4096);
+    /* Start after the notification structure */
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+    subregion_offset = vvup->shared_memory.offset;
 
     for (i = 0; i < memory->nregions; i++) {
         VhostUserMemoryRegion *input = &memory->regions[i];
@@ -875,7 +912,10 @@ static void virtio_vhost_user_doorbells_write(void *opaque, hwaddr addr,
                                               uint64_t val, unsigned size)
 {
     VirtIOVhostUser *s = opaque;
-    unsigned idx = addr / sizeof(uint16_t);
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+    unsigned idx = addr / virtio_pci_queue_mem_mult(proxy);
+
 
     if (idx < VIRTIO_QUEUE_MAX) {
         /* TODO use memory_region_add_eventfd() to avoid entering QEMU */
@@ -892,22 +932,97 @@ static void virtio_vhost_user_doorbells_write(void *opaque, hwaddr addr,
     }
 }
 
+static uint64_t virtio_vhost_user_notification_read(void *opaque, hwaddr addr,
+                                               unsigned size)
+{
+    VirtIOVhostUser *s = opaque;
+    uint64_t val = 0;
+
+    switch (addr) {
+    case NOTIFICATION_SELECT:
+           val = s->nselect;
+           break;
+    case NOTIFICATION_MSIX_VECTOR:
+           if (s->nselect < ARRAY_SIZE(s->kickfds))
+               val = s->kickfds[s->nselect].msi_vector;
+           break;
+    default:
+           break;
+    }
+
+    trace_virtio_vhost_user_notification_read(s, addr, val);
+
+    return val;
+}
+
+/* Set the MSI vectors for the master virtqueue notifications. */
+static void virtio_vhost_user_notification_write(void *opaque, hwaddr addr,
+                                               uint64_t val, unsigned size)
+{
+   /* MMIO regions are byte-addressable. The value of the `addr` argument is
+    * relative to the starting address of the MMIO region. For example,
+    * `addr = 6` means that the 6th byte of this MMIO region has been written.
+    */
+    VirtIOVhostUser *s = opaque;
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+
+    switch (addr) {
+    case NOTIFICATION_SELECT:
+       if (val < VIRTIO_QUEUE_MAX) {
+            s->nselect = val;
+       }
+       break;
+    case NOTIFICATION_MSIX_VECTOR:
+       msix_vector_unuse(&proxy->pci_dev, s->kickfds[s->nselect].msi_vector);
+       if (msix_vector_use(&proxy->pci_dev, val) < 0) {
+           val = VIRTIO_NO_VECTOR;
+       }
+        s->kickfds[s->nselect].msi_vector = val;
+       break;
+    default:
+        break;
+    }
+
+    trace_virtio_vhost_user_notification_write(s, addr, val);
+}
+
+/* Handler for the master kickfd notifications. Inject an INTx or MSI-X interrupt
+ * to the guest in response to the master notification. Use the appropriate
+ * vector in the latter case.
+ */
+void virtio_vhost_user_guest_notifier_read(EventNotifier *n)
+{
+    struct kickfd *kickfd = container_of(n, struct kickfd, guest_notifier);
+    VirtIODevice *vdev = kickfd->vdev;
+    VirtIOVhostUser *vvu = container_of(vdev, struct VirtIOVhostUser, parent_obj);
+    VirtIOVhostUserPCI *vvup = container_of(vvu, struct VirtIOVhostUserPCI, vdev);
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+    PCIDevice *pci_dev = &proxy->pci_dev;
+
+    if (event_notifier_test_and_clear(n)) {
+       /* The ISR status register is used only for INTx interrupts. Thus, we
+        * use it only in this case.
+        */
+       if (!msix_enabled(pci_dev)) {
+           virtio_set_isr(vdev, 0x2);
+       }
+       /* Send an interrupt, either with INTx or MSI-X mechanism. msix_notify()
+        * already handles the case where the MSI-X vector is NO_VECTOR by not issuing
+        * interrupts. Thus, we don't have to check this case here.
+        */
+       virtio_notify_vector(vdev, kickfd->msi_vector);
+
+       trace_virtio_vhost_user_guest_notifier_read(kickfd->guest_notifier.rfd, kickfd->msi_vector);
+    }
+}
+
 /* TODO implement "5.7.7 Additional Device Resources over PCI" in
  * hw/virtio/virtio-pci.c instead of adding PCI BARs here
  * https://stefanha.github.io/virtio/vhost-user-slave.html#x1-2920007
  */
 static void virtio_vhost_user_init_bar(VirtIOVhostUser *s)
 {
-    static const MemoryRegionOps virtio_vhost_user_doorbells_ops = {
-        .read = virtio_vhost_user_doorbells_read,
-        .write = virtio_vhost_user_doorbells_write,
-        .valid = {
-            .min_access_size = 1,
-            .max_access_size = 4,
-        },
-        .endianness = DEVICE_LITTLE_ENDIAN,
-    };
-
     /* virtio-pci doesn't use BAR 2 & 3, so we use it */
     const int bar_index = 2;
 
@@ -921,24 +1036,104 @@ static void virtio_vhost_user_init_bar(VirtIOVhostUser *s)
     memory_region_init(&s->additional_resources_bar, OBJECT(s),
                        "virtio-vhost-user", bar_size);
 
-    memory_region_init_io(&s->doorbell_region, OBJECT(s),
-                          &virtio_vhost_user_doorbells_ops,
-                          s, "virtio-vhost-user-doorbells",
-                          DOORBELLS_SIZE);
-    memory_region_add_subregion(&s->additional_resources_bar, 0,
-                                &s->doorbell_region);
-
     pci_register_bar(&vvup->parent_obj.pci_dev, bar_index,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_PREFETCH |
                      PCI_BASE_ADDRESS_MEM_TYPE_64,
                      &s->additional_resources_bar);
+
+    /* Initialize the VirtIOPCIRegions for the virtio configuration structures
+     * corresponding to the additional device resource capabilities.
+     * Place the additional device resources in the additional_resources_bar.
+     */
+    VirtIOPCIProxy *proxy = VIRTIO_PCI(vvup);
+
+    vvup->doorbells.offset = 0x0;
+    vvup->doorbells.size = virtio_pci_queue_mem_mult(proxy) * (VIRTIO_QUEUE_MAX + 1 /* logfd */);
+    /* TODO Not sure if it is necessary for the size to be aligned */
+    vvup->doorbells.size = QEMU_ALIGN_UP(vvup->doorbells.size, 4096);
+    vvup->doorbells.type = VIRTIO_PCI_CAP_DOORBELL_CFG;
+
+    vvup->notifications.offset = vvup->doorbells.offset + vvup->doorbells.size;
+    vvup->notifications.size = 0x1000;
+    vvup->notifications.type = VIRTIO_PCI_CAP_NOTIFICATION_CFG;
+
+    /* cap.offset and cap.length must be 4096-byte (0x1000) aligned. */
+    vvup->shared_memory.offset = vvup->notifications.offset + vvup->notifications.size;
+    vvup->shared_memory.offset = QEMU_ALIGN_UP(vvup->shared_memory.offset, 4096);
+    /* TODO Reconsider the shared memory cap.length later */
+    /* The size of the shared memory region in the additional resources BAR doesn't
+     * fit into the length field (uint32_t) of the virtio capability structure.
+     * However, we don't need to pass this information to the guest driver via
+     * the shared memory capability because the guest can figure out the length of
+     * the vhost memory regions from the SET_MEM_TABLE vhost-user messages. Therefore,
+     * the size of the shared memory region that we are declaring here has no
+     * meaning and the guest driver shouldn't rely on this.
+     */
+    vvup->shared_memory.size = 0x1000;
+    vvup->shared_memory.type = VIRTIO_PCI_CAP_SHARED_MEMORY_CFG;
+
+    /* Initialize the MMIO MemoryRegions for the additional device resources. */
+
+    static struct MemoryRegionOps doorbell_ops = {
+        .read = virtio_vhost_user_doorbells_read,
+       .write = virtio_vhost_user_doorbells_write,
+       .impl = {
+           .min_access_size = 1,
+           .max_access_size = 4,
+       },
+       .endianness = DEVICE_LITTLE_ENDIAN,
+    };
+
+    static struct MemoryRegionOps notification_ops = {
+        .read = virtio_vhost_user_notification_read,
+        .write = virtio_vhost_user_notification_write,
+        .impl = {
+            .min_access_size = 1,
+            .max_access_size = 4,
+        },
+        .endianness = DEVICE_LITTLE_ENDIAN,
+    };
+
+    memory_region_init_io(&vvup->doorbells.mr, OBJECT(s),
+                   &doorbell_ops, s, "virtio-vhost-user-doorbell-cfg",
+                   vvup->doorbells.size);
+
+    memory_region_init_io(&vvup->notifications.mr, OBJECT(s),
+                    &notification_ops, s, "virtio-vhost-user-notification-cfg",
+                    vvup->notifications.size);
+
+    /* Register the virtio PCI configuration structures
+     * for the additional device resources. This involves
+     * registering the corresponding MemoryRegions as
+     * subregions of the additional_resources_bar and creating
+     * virtio capabilities.
+     */
+    struct virtio_pci_cap cap = {
+        .cap_len = sizeof cap,
+    };
+    struct virtio_pci_doorbell_cap doorbell = {
+        .cap.cap_len = sizeof doorbell,
+        .doorbell_off_multiplier =
+            cpu_to_le32(virtio_pci_queue_mem_mult(proxy)),
+    };
+
+    virtio_pci_modern_region_map(proxy, &vvup->doorbells, &doorbell.cap,
+                                 &s->additional_resources_bar, bar_index);
+    virtio_pci_modern_region_map(proxy, &vvup->notifications, &cap,
+                                 &s->additional_resources_bar, bar_index);
+    virtio_pci_modern_region_map(proxy, &vvup->shared_memory, &cap,
+                                 &s->additional_resources_bar, bar_index);
 }
 
 static void virtio_vhost_user_cleanup_bar(VirtIOVhostUser *s)
 {
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+
     memory_region_del_subregion(&s->additional_resources_bar,
-                                &s->doorbell_region);
+                                &vvup->doorbells.mr);
+    memory_region_del_subregion(&s->additional_resources_bar,
+                                &vvup->notifications.mr);
 }
 
 static void virtio_vhost_user_device_realize(DeviceState *dev, Error **errp)
@@ -950,6 +1145,12 @@ static void virtio_vhost_user_device_realize(DeviceState *dev, Error **errp)
     if (!qemu_chr_fe_backend_connected(&s->chr)) {
         error_setg(errp, "Missing chardev");
         return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(s->kickfds); i++) {
+       s->kickfds[i].vdev = vdev;
+       event_notifier_init_fd(&s->kickfds[i].guest_notifier, -1);
+       s->kickfds[i].msi_vector = VIRTIO_NO_VECTOR;
     }
 
     for (i = 0; i < ARRAY_SIZE(s->callfds); i++) {
@@ -988,6 +1189,7 @@ static void virtio_vhost_user_device_unrealize(DeviceState *dev, Error **errp)
     virtio_cleanup(vdev);
     virtio_vhost_user_cleanup_bar(s);
     virtio_vhost_user_cleanup_mem_table(s);
+    virtio_vhost_user_cleanup_kickfds(s);
     virtio_vhost_user_cleanup_callfds(s);
 }
 

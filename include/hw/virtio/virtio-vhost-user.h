@@ -15,12 +15,22 @@
 #define QEMU_VIRTIO_VHOST_USER_H
 
 #include "hw/virtio/virtio.h"
+#include "standard-headers/linux/virtio_pci.h"
 #include "hw/virtio/vhost-user.h"
 #include "chardev/char-fe.h"
 
 #define TYPE_VIRTIO_VHOST_USER "virtio-vhost-user-device"
 #define VIRTIO_VHOST_USER(obj) \
         OBJECT_CHECK(VirtIOVhostUser, (obj), TYPE_VIRTIO_VHOST_USER)
+
+/* Macros for the offsets in virtio notification structure */
+#define NOTIFICATION_SELECT            0
+#define NOTIFICATION_MSIX_VECTOR       2
+
+/* Macros for the additional resources configuration types */
+#define VIRTIO_PCI_CAP_DOORBELL_CFG 6
+#define VIRTIO_PCI_CAP_NOTIFICATION_CFG 7
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
 
 /* The virtio configuration space fields */
 typedef struct {
@@ -38,6 +48,26 @@ typedef struct {
     size_t total_size;
 } VirtIOVhostUserMemTableRegion;
 
+struct kickfd {
+    VirtIODevice *vdev;
+    EventNotifier guest_notifier;
+    uint16_t msi_vector;
+};
+
+/* Additional resources configuration structures */
+
+/* Doorbell structure layout */
+struct virtio_pci_doorbell_cap {
+    struct virtio_pci_cap cap;
+    uint32_t doorbell_off_multiplier;
+};
+
+/* Notification structure layout */
+struct virtio_pci_notification_cfg {
+    uint16_t notification_select;              /* read-write */
+    uint16_t notification_msix_vector;         /* read-write */
+};
+
 typedef struct VirtIOVhostUser VirtIOVhostUser;
 struct VirtIOVhostUser {
     VirtIODevice parent_obj;
@@ -50,7 +80,13 @@ struct VirtIOVhostUser {
      * https://stefanha.github.io/virtio/vhost-user-slave.html#x1-2920007
      */
     MemoryRegion additional_resources_bar;
-    MemoryRegion doorbell_region;
+
+    /* notification select */
+    uint16_t nselect;
+    /* Eventfds from VHOST_USER_SET_VRING_KICK along with
+     * the MSI-X vectors.
+     */
+    struct kickfd kickfds[VIRTIO_QUEUE_MAX];
 
     /* Eventfds from VHOST_USER_SET_VRING_CALL */
     int callfds[VIRTIO_QUEUE_MAX];

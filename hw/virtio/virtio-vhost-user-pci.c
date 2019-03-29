@@ -38,7 +38,8 @@ struct VirtIOVhostUserPCI {
 };
 */
 static Property virtio_vhost_user_pci_properties[] = {
-    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 3),
+    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
+                       DEV_NVECTORS_UNSPECIFIED),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -47,6 +48,10 @@ static void virtio_vhost_user_pci_realize(VirtIOPCIProxy *vpci_dev,
 {
     VirtIOVhostUserPCI *vvup = VIRTIO_VHOST_USER_PCI(vpci_dev);
     DeviceState *vdev = DEVICE(&vvup->vdev);
+
+    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
+        vpci_dev->nvectors = VIRTIO_QUEUE_MAX + 3;
+    }
 
     qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
     object_property_set_bool(OBJECT(vdev), true, "realized", errp);
