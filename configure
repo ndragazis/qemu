@@ -374,6 +374,7 @@ vhost_crypto=""
 vhost_scsi=""
 vhost_vsock=""
 vhost_user=""
+virtio_vhost_user=""
 kvm="no"
 hax="no"
 hvf="no"
@@ -1492,6 +1493,10 @@ for opt do
   ;;
   --enable-vhost-user) vhost_user="yes"
   ;;
+  --disable-virtio-vhost-user) virtio_vhost_user="no"
+  ;;
+  --enable-virtio-vhost-user) virtio_vhost_user="yes"
+  ;;
   --disable-vhost-kernel) vhost_kernel="no"
   ;;
   --enable-vhost-kernel) vhost_kernel="yes"
@@ -1525,6 +1530,15 @@ for opt do
   ;;
   esac
 done
+
+# UNIX domain sockets are required
+if test "$virtio_vhost_user" = ""; then
+    if test "$mingw32" = "yes"; then
+        virtio_vhost_user="no"
+    else
+        virtio_vhost_user="yes"
+    fi
+fi
 
 case "$cpu" in
     ppc)
@@ -6380,6 +6394,7 @@ echo "vhost-crypto support $vhost_crypto"
 echo "vhost-scsi support $vhost_scsi"
 echo "vhost-vsock support $vhost_vsock"
 echo "vhost-user support $vhost_user"
+echo "virtio-vhost-user support $virtio_vhost_user"
 echo "Trace backends    $trace_backends"
 if have_backend "simple"; then
 echo "Trace output file $trace_file-<pid>"
@@ -6868,6 +6883,9 @@ if test "$vhost_kernel" = "yes" ; then
 fi
 if test "$vhost_user" = "yes" ; then
   echo "CONFIG_VHOST_USER=y" >> $config_host_mak
+fi
+if test "$virtio_vhost_user" = "yes" ; then
+  echo "CONFIG_VIRTIO_VHOST_USER=y" >> $config_host_mak
 fi
 if test "$blobs" = "yes" ; then
   echo "INSTALL_BLOBS=yes" >> $config_host_mak
