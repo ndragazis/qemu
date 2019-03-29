@@ -18,6 +18,10 @@
 #include "hw/pci/msi.h"
 #include "hw/virtio/virtio-bus.h"
 
+#ifdef CONFIG_VIRTIO_VHOST_USER
+#include "hw/virtio/virtio-vhost-user.h" /* TODO remove this later */
+#endif
+
 typedef struct VirtIOPCIProxy VirtIOPCIProxy;
 
 /* virtio-pci-bus */
@@ -238,4 +242,14 @@ typedef struct VirtioPCIDeviceTypeInfo {
 /* Register virtio-pci type(s).  @t must be static. */
 void virtio_pci_types_register(const VirtioPCIDeviceTypeInfo *t);
 
+/* TODO Remove this later */
+#ifdef CONFIG_VIRTIO_VHOST_USER
+typedef struct VirtIOVhostUserPCI VirtIOVhostUserPCI;
+
+struct VirtIOVhostUserPCI {
+    VirtIOPCIProxy parent_obj;
+    VirtIOVhostUser vdev;
+};
+
+#endif
 #endif
