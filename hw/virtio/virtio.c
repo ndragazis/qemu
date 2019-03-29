@@ -31,6 +31,9 @@
  */
 #define VIRTIO_PCI_VRING_ALIGN         4096
 
+void virtio_set_isr(VirtIODevice *vdev, int value);
+void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector);
+
 typedef struct VRingDesc
 {
     uint64_t addr;
@@ -1112,7 +1115,7 @@ void qemu_put_virtqueue_element(QEMUFile *f, VirtQueueElement *elem)
 }
 
 /* virtio device */
-static void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector)
+void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector)
 {
     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
@@ -1615,7 +1618,7 @@ void virtio_del_queue(VirtIODevice *vdev, int n)
     vdev->vq[n].handle_aio_output = NULL;
 }
 
-static void virtio_set_isr(VirtIODevice *vdev, int value)
+void virtio_set_isr(VirtIODevice *vdev, int value)
 {
     uint8_t old = atomic_read(&vdev->isr);
 
