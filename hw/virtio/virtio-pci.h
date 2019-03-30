@@ -250,6 +250,8 @@ struct VirtIOVhostUserPCI {
     VirtIOPCIProxy parent_obj;
     VirtIOVhostUser vdev;
 
+    MemoryRegion additional_resources_bar;
+
     VirtIOPCIRegion doorbells;
     VirtIOPCIRegion notifications;
     VirtIOPCIRegion shared_memory;
