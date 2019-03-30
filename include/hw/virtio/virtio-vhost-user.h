@@ -75,12 +75,6 @@ struct VirtIOVhostUser {
     /* The vhost-user socket */
     CharBackend chr;
 
-    /* TODO implement "Additional Device Resources over PCI" so that PCI
-     * details are hidden:
-     * https://stefanha.github.io/virtio/vhost-user-slave.html#x1-2920007
-     */
-    MemoryRegion additional_resources_bar;
-
     /* notification select */
     uint16_t nselect;
     /* Eventfds from VHOST_USER_SET_VRING_KICK along with
