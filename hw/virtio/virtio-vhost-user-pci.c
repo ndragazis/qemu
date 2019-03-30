@@ -33,6 +33,10 @@ void virtio_vhost_user_set_vhost_mem_regions(VirtIOVhostUser *s);
 void virtio_vhost_user_delete_vhost_mem_region(VirtIOVhostUser *s, MemoryRegion *mr);
 void virtio_vhost_user_cleanup_additional_resources(VirtIOVhostUser *s);
 
+void virtio_vhost_user_guest_notifier_read(EventNotifier *n);
+void virtio_set_isr(VirtIODevice *vdev, int value);
+void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector);
+
 /*
  * virtio-vhost-user-pci: This extends VirtioPCIProxy.
  */
@@ -44,16 +48,18 @@ void virtio_vhost_user_cleanup_additional_resources(VirtIOVhostUser *s);
         OBJECT_GET_CLASS(VirtioVhostUserPCIClass, obj, TYPE_VIRTIO_VHOST_USER_PCI)
 #define VIRTIO_VHOST_USER_PCI_CLASS(klass) \
         OBJECT_CLASS_CHECK(VirtioVhostUserPCIClass, klass, TYPE_VIRTIO_VHOST_USER_PCI)
-/* TODO The definition has been temporarily moved into hw/virtio/virtio-pci.h
- * because we want it to be accessible from hw/virtio/virtio-vhost-user.c. This
- * is going to be fixed in later commits.
- */
-/*
+
 struct VirtIOVhostUserPCI {
     VirtIOPCIProxy parent_obj;
     VirtIOVhostUser vdev;
+
+    MemoryRegion additional_resources_bar;
+
+    VirtIOPCIRegion doorbells;
+    VirtIOPCIRegion notifications;
+    VirtIOPCIRegion shared_memory;
 };
-*/
+
 typedef struct VirtioVhostUserPCIClass {
     VirtioPCIClass parent_class;
 
@@ -67,6 +73,36 @@ static Property virtio_vhost_user_pci_properties[] = {
                        DEV_NVECTORS_UNSPECIFIED),
     DEFINE_PROP_END_OF_LIST(),
 };
+
+/* Handler for the master kickfd notifications. Inject an INTx or MSI-X interrupt
+ * to the guest in response to the master notification. Use the appropriate
+ * vector in the latter case.
+ */
+void virtio_vhost_user_guest_notifier_read(EventNotifier *n)
+{
+    struct kickfd *kickfd = container_of(n, struct kickfd, guest_notifier);
+    VirtIODevice *vdev = kickfd->vdev;
+    VirtIOVhostUser *vvu = container_of(vdev, struct VirtIOVhostUser, parent_obj);
+    VirtIOVhostUserPCI *vvup = container_of(vvu, struct VirtIOVhostUserPCI, vdev);
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+    PCIDevice *pci_dev = &proxy->pci_dev;
+
+    if (event_notifier_test_and_clear(n)) {
+        /* The ISR status register is used only for INTx interrupts. Thus, we
+         * use it only in this case.
+         */
+        if (!msix_enabled(pci_dev)) {
+            virtio_set_isr(vdev, 0x2);
+        }
+        /* Send an interrupt, either with INTx or MSI-X mechanism. msix_notify()
+         * already handles the case where the MSI-X vector is NO_VECTOR by not issuing
+         * interrupts. Thus, we don't have to check this case here.
+         */
+        virtio_notify_vector(vdev, kickfd->msi_vector);
+
+        trace_virtio_vhost_user_guest_notifier_read(kickfd->guest_notifier.rfd, kickfd->msi_vector);
+    }
+}
 
 static uint64_t virtio_vhost_user_doorbells_read(void *opaque, hwaddr addr,
                                                  unsigned size)

@@ -18,9 +18,7 @@
 #include "qemu/sockets.h"
 #include "hw/virtio/virtio-access.h"
 #include "hw/virtio/virtio-vhost-user.h"
-#include "virtio-pci.h"
 #include "trace.h"
-#include "hw/pci/msix.h"
 
 /* vmstate migration version number */
 #define VIRTIO_VHOST_USER_VM_VERSION    0
@@ -94,10 +92,6 @@ typedef enum {
 
 static void conn_state_transition(VirtIOVhostUser *s, ConnectionEvent evt);
 void virtio_vhost_user_guest_notifier_read(EventNotifier *n);
-
-/* TODO Add those function prototypes temporarily. Remove then later. */
-void virtio_set_isr(VirtIODevice *vdev, int value);
-void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector);
 
 void virtio_vhost_user_set_vhost_mem_regions(VirtIOVhostUser *s);
 void virtio_vhost_user_delete_vhost_mem_region(VirtIOVhostUser *s, MemoryRegion *mr);
@@ -886,36 +880,6 @@ static void virtio_vhost_user_reset(VirtIODevice *vdev)
     conn_state_transition(s, CONN_EVENT_DEVICE_RESET);
 
     virtio_vhost_user_reset_async_state(s);
-}
-
-/* Handler for the master kickfd notifications. Inject an INTx or MSI-X interrupt
- * to the guest in response to the master notification. Use the appropriate
- * vector in the latter case.
- */
-void virtio_vhost_user_guest_notifier_read(EventNotifier *n)
-{
-    struct kickfd *kickfd = container_of(n, struct kickfd, guest_notifier);
-    VirtIODevice *vdev = kickfd->vdev;
-    VirtIOVhostUser *vvu = container_of(vdev, struct VirtIOVhostUser, parent_obj);
-    VirtIOVhostUserPCI *vvup = container_of(vvu, struct VirtIOVhostUserPCI, vdev);
-    VirtIOPCIProxy *proxy = &vvup->parent_obj;
-    PCIDevice *pci_dev = &proxy->pci_dev;
-
-    if (event_notifier_test_and_clear(n)) {
-       /* The ISR status register is used only for INTx interrupts. Thus, we
-        * use it only in this case.
-        */
-       if (!msix_enabled(pci_dev)) {
-           virtio_set_isr(vdev, 0x2);
-       }
-       /* Send an interrupt, either with INTx or MSI-X mechanism. msix_notify()
-        * already handles the case where the MSI-X vector is NO_VECTOR by not issuing
-        * interrupts. Thus, we don't have to check this case here.
-        */
-       virtio_notify_vector(vdev, kickfd->msi_vector);
-
-       trace_virtio_vhost_user_guest_notifier_read(kickfd->guest_notifier.rfd, kickfd->msi_vector);
-    }
 }
 
 static void virtio_vhost_user_device_realize(DeviceState *dev, Error **errp)
