@@ -32,6 +32,10 @@ void virtio_pci_modern_region_map(VirtIOPCIProxy *proxy,
 void virtio_vhost_user_set_vhost_mem_regions(VirtIOVhostUser *s);
 void virtio_vhost_user_delete_vhost_mem_region(VirtIOVhostUser *s, MemoryRegion *mr);
 void virtio_vhost_user_cleanup_additional_resources(VirtIOVhostUser *s);
+void virtio_vhost_user_register_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                         uint8_t vq_idx);
+void virtio_vhost_user_unregister_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                           uint8_t vq_idx);
 
 void virtio_vhost_user_guest_notifier_read(EventNotifier *n);
 void virtio_set_isr(VirtIODevice *vdev, int value);
@@ -66,6 +70,10 @@ typedef struct VirtioVhostUserPCIClass {
     void (*set_vhost_mem_regions)(VirtIOVhostUserPCI *vvup);
     void (*delete_vhost_mem_region)(VirtIOVhostUserPCI *vvup, MemoryRegion *mr);
     void (*cleanup_bar)(VirtIOVhostUserPCI *vvup);
+    void (*register_doorbell)(VirtIOVhostUserPCI *vvup, EventNotifier *e,
+                              uint8_t vq_idx);
+    void (*unregister_doorbell)(VirtIOVhostUserPCI *vvup, EventNotifier *e,
+                                uint8_t vq_idx);
 } VirtioVhostUserPCIClass;
 
 static Property virtio_vhost_user_pci_properties[] = {
@@ -119,18 +127,55 @@ static void virtio_vhost_user_doorbells_write(void *opaque, hwaddr addr,
     unsigned idx = addr / virtio_pci_queue_mem_mult(proxy);
 
     if (idx < VIRTIO_QUEUE_MAX) {
-        /* TODO use memory_region_add_eventfd() to avoid entering QEMU */
-
-        if (s->callfds[idx] >= 0) {
-            uint64_t val = 1;
+        /* We shouldn't reach at this point since we are using ioeventfds. */
+        if (event_notifier_get_fd(&s->callfds[idx]) >= 0) {
             ssize_t nwritten;
 
-            nwritten = write(s->callfds[idx], &val, sizeof(val));
+            nwritten = event_notifier_set(&s->callfds[idx]);
             trace_virtio_vhost_user_doorbell_write(s, idx, nwritten);
+
         }
     } else if (idx == VIRTIO_QUEUE_MAX) {
         /* TODO log doorbell */
    }
+}
+
+static void vvu_register_doorbell(VirtIOVhostUserPCI *vvup, EventNotifier *e,
+                                  uint8_t vq_idx)
+{
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+    hwaddr addr = vq_idx * virtio_pci_queue_mem_mult(proxy);
+
+    /* Register the callfd EventNotifier as ioeventfd */
+    memory_region_add_eventfd(&vvup->doorbells.mr, addr, 2, false, vq_idx, e);
+}
+
+void virtio_vhost_user_register_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                         uint8_t vq_idx)
+{
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+    VirtioVhostUserPCIClass *vvup_class = VIRTIO_VHOST_USER_PCI_GET_CLASS(vvup);
+
+    vvup_class->register_doorbell(vvup, e, vq_idx);
+}
+
+static void vvu_unregister_doorbell(VirtIOVhostUserPCI *vvup, EventNotifier *e,
+                                    uint8_t vq_idx)
+{
+    VirtIOPCIProxy *proxy = &vvup->parent_obj;
+    hwaddr addr = vq_idx * virtio_pci_queue_mem_mult(proxy);
+
+    /* Unregister the callfd EventNotifier */
+    memory_region_del_eventfd(&vvup->doorbells.mr, addr, 2, false, vq_idx, e);
+}
+
+void virtio_vhost_user_unregister_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                           uint8_t vq_idx)
+{
+    VirtIOVhostUserPCI *vvup = container_of(s, struct VirtIOVhostUserPCI, vdev);
+    VirtioVhostUserPCIClass *vvup_class = VIRTIO_VHOST_USER_PCI_GET_CLASS(vvup);
+
+    vvup_class->unregister_doorbell(vvup, e, vq_idx);
 }
 
 static uint64_t virtio_vhost_user_notification_read(void *opaque, hwaddr addr,
@@ -337,7 +382,6 @@ static void virtio_vhost_user_init_bar(VirtIOVhostUserPCI *vvup)
                                  &vvup->additional_resources_bar, bar_index);
     virtio_pci_modern_region_map(proxy, &vvup->shared_memory, &cap,
                                  &vvup->additional_resources_bar, bar_index);
-
 }
 
 static void vvu_cleanup_bar(VirtIOVhostUserPCI *vvup)
@@ -391,6 +435,8 @@ static void virtio_vhost_user_pci_class_init(ObjectClass *klass, void *data)
     vvup_class->set_vhost_mem_regions = vvu_set_vhost_mem_regions;
     vvup_class->delete_vhost_mem_region = vvu_delete_vhost_mem_region;
     vvup_class->cleanup_bar = vvu_cleanup_bar;
+    vvup_class->register_doorbell = vvu_register_doorbell;
+    vvup_class->unregister_doorbell = vvu_unregister_doorbell;
 }
 
 static void virtio_vhost_user_pci_initfn(Object *obj)
