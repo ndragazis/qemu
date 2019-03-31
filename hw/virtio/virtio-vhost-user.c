@@ -96,6 +96,10 @@ void virtio_vhost_user_guest_notifier_read(EventNotifier *n);
 void virtio_vhost_user_set_vhost_mem_regions(VirtIOVhostUser *s);
 void virtio_vhost_user_delete_vhost_mem_region(VirtIOVhostUser *s, MemoryRegion *mr);
 void virtio_vhost_user_cleanup_additional_resources(VirtIOVhostUser *s);
+void virtio_vhost_user_register_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                         uint8_t vq_idx);
+void virtio_vhost_user_unregister_doorbell(VirtIOVhostUser *s, EventNotifier *e,
+                                           uint8_t vq_idx);
 
 static void virtio_vhost_user_reset_async_state(VirtIOVhostUser *s)
 {
@@ -260,9 +264,9 @@ static void virtio_vhost_user_cleanup_callfds(VirtIOVhostUser *s)
     size_t i;
 
     for (i = 0; i < ARRAY_SIZE(s->callfds); i++) {
-        if (s->callfds[i] >= 0) {
-            close(s->callfds[i]);
-            s->callfds[i] = -1;
+        if (event_notifier_get_fd(&s->callfds[i]) >= 0) {
+            virtio_vhost_user_unregister_doorbell(s, &s->callfds[i], i);
+            event_notifier_cleanup(&s->callfds[i]);
         }
     }
 }
@@ -494,11 +498,16 @@ static void m2s_set_vring_call(VirtIOVhostUser *s)
         qemu_set_nonblock(fd);
     }
 
-    if (s->callfds[vq_idx] >= 0) {
-        close(s->callfds[vq_idx]);
+    if (event_notifier_get_fd(&s->callfds[vq_idx]) >= 0) {
+        virtio_vhost_user_unregister_doorbell(s, &s->callfds[vq_idx], vq_idx);
+        event_notifier_cleanup(&s->callfds[vq_idx]);
     }
 
-    s->callfds[vq_idx] = fd;
+    /* Initialize the EventNotifier with the received callfd */
+    event_notifier_init_fd(&s->callfds[vq_idx], fd);
+
+    /* Register the EventNotifier as an ioeventfd. */
+    virtio_vhost_user_register_doorbell(s, &s->callfds[vq_idx], vq_idx);
 }
 
 static void m2s_set_mem_table(VirtIOVhostUser *s)
@@ -900,7 +909,7 @@ static void virtio_vhost_user_device_realize(DeviceState *dev, Error **errp)
     }
 
     for (i = 0; i < ARRAY_SIZE(s->callfds); i++) {
-        s->callfds[i] = -1;
+        event_notifier_init_fd(&s->callfds[i], -1);
     }
 
     virtio_init(vdev, "virtio-vhost-user", VIRTIO_ID_VHOST_USER,

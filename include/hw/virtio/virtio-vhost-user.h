@@ -83,7 +83,7 @@ struct VirtIOVhostUser {
     struct kickfd kickfds[VIRTIO_QUEUE_MAX];
 
     /* Eventfds from VHOST_USER_SET_VRING_CALL */
-    int callfds[VIRTIO_QUEUE_MAX];
+    EventNotifier callfds[VIRTIO_QUEUE_MAX];
 
     /* Mapped memory regions from VHOST_USER_SET_MEM_TABLE */
     VirtIOVhostUserMemTableRegion mem_table[VHOST_MEMORY_MAX_NREGIONS];
