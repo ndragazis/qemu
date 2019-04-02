@@ -252,8 +252,9 @@ static void virtio_vhost_user_cleanup_kickfds(VirtIOVhostUser *s)
     for (i = 0; i < ARRAY_SIZE(s->kickfds); i++) {
        if (event_notifier_get_fd(&s->kickfds[i].guest_notifier) >= 0) {
            /* Remove the kickfd from the main event loop */
-            event_notifier_set_handler(&s->kickfds[i].guest_notifier, NULL);
-           event_notifier_cleanup(&s->kickfds[i].guest_notifier);
+           event_notifier_set_handler(&s->kickfds[i].guest_notifier, NULL);
+           close(s->kickfds[i].guest_notifier.rfd);
+           event_notifier_init_fd(&s->kickfds[i].guest_notifier, -1);
            s->kickfds[i].msi_vector = VIRTIO_NO_VECTOR;
        }
     }
@@ -266,7 +267,8 @@ static void virtio_vhost_user_cleanup_callfds(VirtIOVhostUser *s)
     for (i = 0; i < ARRAY_SIZE(s->callfds); i++) {
         if (event_notifier_get_fd(&s->callfds[i]) >= 0) {
             virtio_vhost_user_unregister_doorbell(s, &s->callfds[i], i);
-            event_notifier_cleanup(&s->callfds[i]);
+            close(s->callfds[i].rfd);
+            event_notifier_init_fd(&s->callfds[i], -1);
         }
     }
 }
@@ -453,6 +455,26 @@ static void virtio_vhost_user_deliver_m2s(VirtIOVhostUser *s)
                                virtio_vhost_user_hdr_done);
 }
 
+static void m2s_get_vring_base(VirtIOVhostUser *s)
+{
+    unsigned int vq_idx;
+
+    vq_idx = s->read_msg.payload.state.index;
+
+    if (event_notifier_get_fd(&s->kickfds[vq_idx].guest_notifier) >= 0) {
+        /* Remove the kickfd from the main event loop */
+        event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, NULL);
+        close(s->kickfds[vq_idx].guest_notifier.rfd);
+        event_notifier_init_fd(&s->kickfds[vq_idx].guest_notifier, -1);
+    }
+
+    if (event_notifier_get_fd(&s->callfds[vq_idx]) >= 0) {
+        virtio_vhost_user_unregister_doorbell(s, &s->callfds[vq_idx], vq_idx);
+        close(s->callfds[vq_idx].rfd);
+        event_notifier_init_fd(&s->callfds[vq_idx], -1);
+    }
+}
+
 static void m2s_set_vring_kick(VirtIOVhostUser *s)
 {
     uint8_t vq_idx;
@@ -464,19 +486,25 @@ static void m2s_set_vring_kick(VirtIOVhostUser *s)
         fd = -1;
     } else {
         fd = qemu_chr_fe_get_msgfd(&s->chr);
+
+        /* Must not block when reach max eventfd counter value */
+        qemu_set_nonblock(fd);
     }
 
     if (event_notifier_get_fd(&s->kickfds[vq_idx].guest_notifier) >= 0) {
        /* Remove the kickfd from the main event loop */
        event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, NULL);
-       event_notifier_cleanup(&s->kickfds[vq_idx].guest_notifier);
+       close(s->kickfds[vq_idx].guest_notifier.rfd);
+       event_notifier_init_fd(&s->kickfds[vq_idx].guest_notifier, -1);
     }
 
     /* Initialize the EventNotifier with the received kickfd */
     event_notifier_init_fd(&s->kickfds[vq_idx].guest_notifier, fd);
 
     /* Insert the kickfd in the main event loop */
-    event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, virtio_vhost_user_guest_notifier_read);
+    if (fd != -1) {
+        event_notifier_set_handler(&s->kickfds[vq_idx].guest_notifier, virtio_vhost_user_guest_notifier_read);
+    }
 }
 
 static void m2s_set_vring_call(VirtIOVhostUser *s)
@@ -500,14 +528,17 @@ static void m2s_set_vring_call(VirtIOVhostUser *s)
 
     if (event_notifier_get_fd(&s->callfds[vq_idx]) >= 0) {
         virtio_vhost_user_unregister_doorbell(s, &s->callfds[vq_idx], vq_idx);
-        event_notifier_cleanup(&s->callfds[vq_idx]);
+        close(s->callfds[vq_idx].rfd);
+        event_notifier_init_fd(&s->callfds[vq_idx], -1);
     }
 
     /* Initialize the EventNotifier with the received callfd */
     event_notifier_init_fd(&s->callfds[vq_idx], fd);
 
     /* Register the EventNotifier as an ioeventfd. */
-    virtio_vhost_user_register_doorbell(s, &s->callfds[vq_idx], vq_idx);
+    if (fd != -1) {
+        virtio_vhost_user_register_doorbell(s, &s->callfds[vq_idx], vq_idx);
+    }
 }
 
 static void m2s_set_mem_table(VirtIOVhostUser *s)
@@ -623,6 +654,7 @@ static void virtio_vhost_user_parse_m2s(VirtIOVhostUser *s)
     case VHOST_USER_SET_VRING_BASE:
         break;
     case VHOST_USER_GET_VRING_BASE:
+        m2s_get_vring_base(s);
         break;
     case VHOST_USER_SET_VRING_KICK:
         m2s_set_vring_kick(s);
