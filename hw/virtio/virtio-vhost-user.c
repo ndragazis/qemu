@@ -19,6 +19,7 @@
 #include "hw/virtio/virtio-access.h"
 #include "hw/virtio/virtio-vhost-user.h"
 #include "trace.h"
+#include "qemu/uuid.h"
 
 /* vmstate migration version number */
 #define VIRTIO_VHOST_USER_VM_VERSION    0
@@ -955,7 +956,10 @@ static void virtio_vhost_user_device_realize(DeviceState *dev, Error **errp)
     /* Each vhost-user queue uses doorbells and a notification resources */
     s->config.max_vhost_queues = 1024;
 
-    /* TODO uuid */
+    /* Generate a uuid */
+    QemuUUID uuid;
+    qemu_uuid_generate(&uuid);
+    memcpy(s->config.uuid, uuid.data, sizeof(uuid.data));
 
     virtio_vhost_user_reset_async_state(s);
 
